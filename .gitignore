@@ -1,0 +1,14 @@
+# Não versionar binários/artefatos grandes ou segredos
+*.exe
+*.zip
+*.tar
+*.tar.gz
+*.deb
+*.msi
+id_ed25519*
+*.key
+*.crt
+data/
+logs/
+.DS_Store
+Thumbs.db
