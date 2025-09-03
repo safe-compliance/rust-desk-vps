@@ -1,23 +1,18 @@
 # WindowsAgentAIOInstall_SafeCompliance.ps1
-# Executar este arquivo (ele se auto-eleva). Faz tudo sozinho.
-# - Instala/atualiza RustDesk
-# - Aplica cfg + senha permanente
-# - Regras de firewall (allow seu host/porta + block resto para o processo)
-# - Trava TOMLs em todos os usuários e no serviço (LocalService)
-# - Cria tarefa "de manutenção" para travar configs em logons futuros
+# Executar este arquivo (auto-eleva). Faz:
+# - instala/atualiza RustDesk
+# - aplica cfg + senha permanente
+# - regras de firewall
+# - trava TOMLs (usuários e serviço) e cria tarefa de manutenção
 
 $ErrorActionPreference = 'Stop'
 
-### ==== AJUSTES DA SAFE COMPLIANCE ==== ###
+### ==== AJUSTES ==== ###
 $RUSTDESK_CFG = '0nI98WYPdGek52MytWdyd3N3ZHRjt0Z4Q2YsZlQEZFWSN1N0g0NMNmVRRHN1lmI6ISeltmIsIici5SbvNmLlNmbhlGbw12bjVmZhNnLvR3btVmcv8iOzBHd0hmI6ISawFmIsIici5SbvNmLlNmbhlGbw12bjVmZhNnLvR3btVmciojI5FGblJnIsIici5SbvNmLlNmbhlGbw12bjVmZhNnLvR3btVmciojI0N3boJye'
-
-# Senha permanente que só vocês sabem
 $RUSTDESK_PERM_PW = 'Safe@2025#'
-
-# Seu domínio/IP do servidor
-$RUSTDESK_HOST = 'remoto.safecompliance.com.br'
-$ALLOW_IP      = '172.93.106.219'     # opcional: IP do servidor
-### ===================================== ###
+$RUSTDESK_HOST   = 'remoto.safecompliance.com.br'
+$ALLOW_IP        = '172.93.106.219'     # opcional
+### ================== ###
 
 # Caminhos
 $RUSTDESK_EXE  = 'C:\Program Files\RustDesk\rustdesk.exe'
@@ -40,11 +35,8 @@ function Get-LatestRustDeskTag {
 }
 
 function Install-Or-UpdateRustDesk {
-  if (!(Test-Path $RUSTDESK_EXE)) {
-    Write-Host "Instalando RustDesk..." -f Cyan
-  } else {
-    Write-Host "Verificando atualização do RustDesk..." -f Cyan
-  }
+  if (!(Test-Path $RUSTDESK_EXE)) { Write-Host "Instalando RustDesk..." -f Cyan }
+  else { Write-Host "Verificando atualização do RustDesk..." -f Cyan }
 
   $tag = Get-LatestRustDeskTag
   $dl  = if ($tag) {
@@ -55,16 +47,16 @@ function Install-Or-UpdateRustDesk {
 
   $tmp = Join-Path $env:TEMP 'rustdesk-setup.exe'
   Invoke-WebRequest $dl -OutFile $tmp
-  Start-Process $tmp --% --silent-install -Wait
+
+  # <<< CORREÇÃO AQUI >>>
+  Start-Process -FilePath $tmp -ArgumentList @('--silent-install') -Wait
   Start-Sleep 6
 
-  # instala serviço se faltar
   if (-not (Get-Service -Name rustdesk -ErrorAction SilentlyContinue)) {
-    Start-Process $RUSTDESK_EXE --% --install-service -Wait
+    Start-Process -FilePath $RUSTDESK_EXE -ArgumentList @('--install-service') -Wait
     Start-Sleep 6
   }
 
-  # garante serviço rodando
   $svc = Get-Service rustdesk -ErrorAction SilentlyContinue
   if ($svc.Status -ne 'Running') { Start-Service rustdesk }
 }
@@ -74,12 +66,12 @@ function Apply-Cfg-And-Password {
     throw "Você precisa colar a **CFG string** em `\$RUSTDESK_CFG`."
   }
   Write-Host "Aplicando configuração e senha permanente..." -f Cyan
-  Start-Process $RUSTDESK_EXE --% --config "$RUSTDESK_CFG" -WindowStyle Hidden -Wait
-  Start-Process $RUSTDESK_EXE --% --password "$RUSTDESK_PERM_PW" -WindowStyle Hidden -Wait
+  # <<< CORREÇÃO AQUI >>>
+  Start-Process -FilePath $RUSTDESK_EXE -ArgumentList @('--config', $RUSTDESK_CFG) -WindowStyle Hidden -Wait
+  Start-Process -FilePath $RUSTDESK_EXE -ArgumentList @('--password', $RUSTDESK_PERM_PW) -WindowStyle Hidden -Wait
 }
 
 # Lock com SIDs (independente de idioma)
-# S-1-5-18(LocalSystem) | S-1-5-32-544(Administrators) | S-1-5-32-545(Users) | S-1-1-0(Everyone)
 function Lock-Dir($dir) {
   if (!(Test-Path $dir)) { return }
   icacls $dir /inheritance:r | Out-Null
@@ -88,13 +80,10 @@ function Lock-Dir($dir) {
 }
 
 function Lock-UsersToml {
-  # Gera estrutura do usuário atual
   & $RUSTDESK_EXE --get-id | Out-Null
   $meToml = Join-Path $env:APPDATA 'RustDesk\config\RustDesk2.toml'
-
   $profiles = Get-CimInstance Win32_UserProfile |
     Where-Object { $_.LocalPath -like 'C:\Users\*' -and (Split-Path -Leaf $_.LocalPath) -notin @('Public','Default','Default User','All Users') }
-
   foreach ($p in $profiles) {
     $cfgDir = Join-Path $p.LocalPath 'AppData\Roaming\RustDesk\config'
     New-Item -ItemType Directory -Force $cfgDir | Out-Null
@@ -108,7 +97,6 @@ function Lock-UsersToml {
 
 function Lock-ServiceToml {
   $svcDir = "C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk\config"
-  # Garante que o serviço já criou a estrutura
   Start-Service rustdesk -ErrorAction SilentlyContinue
   Start-Sleep 3
   Stop-Service  rustdesk -ErrorAction SilentlyContinue
@@ -116,7 +104,6 @@ function Lock-ServiceToml {
   Start-Service rustdesk -ErrorAction SilentlyContinue
   Start-Sleep 3
 
-  # Script que roda como SYSTEM para travar o diretório do serviço
   $svcScript = @'
 $svcDir = "C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk\config"
 if (Test-Path $svcDir) {
@@ -165,7 +152,6 @@ foreach ($u in $profiles) {
 
 function Configure-Firewall {
   Write-Host "Aplicando regras de firewall..." -f Cyan
-  # Allow somente seu host/IP e portas necessárias para o processo do RustDesk
   $remote = if ($ALLOW_IP) { "$RUSTDESK_HOST,$ALLOW_IP" } else { $RUSTDESK_HOST }
   New-NetFirewallRule -DisplayName "RustDesk - SafeCompliance allow" `
     -Program "$RUSTDESK_EXE" `
@@ -174,7 +160,6 @@ function Configure-Firewall {
     -RemotePort 21115,21116,21117,21118,21119,443 `
     -Protocol TCP -ErrorAction SilentlyContinue | Out-Null
 
-  # Bloqueia o resto para o processo
   New-NetFirewallRule -DisplayName "RustDesk - block others" `
     -Program "$RUSTDESK_EXE" `
     -Direction Outbound -Action Block -ErrorAction SilentlyContinue | Out-Null
@@ -188,7 +173,6 @@ Lock-ServiceToml
 Keep-Locked-OnLogon
 Configure-Firewall
 
-# Mostra ID e resumo
 try {
   $id = & $RUSTDESK_EXE --get-id
   Write-Host ""
@@ -200,3 +184,4 @@ try {
 } catch {}
 
 Write-Host "Concluído." -f Green
+
