@@ -1,0 +1,48 @@
+name: Build Agent EXE
+
+on:
+  push:
+    paths:
+      - 'WindowsAgentAIOInstall.ps1'
+  workflow_dispatch:
+
+permissions:
+  contents: write   # necessário para criar Release
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Trust PSGallery
+        shell: pwsh
+        run: Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+
+      - name: Install ps2exe
+        shell: pwsh
+        run: Install-Module ps2exe -Scope CurrentUser -Force
+
+      - name: Compile EXE
+        shell: pwsh
+        run: |
+          $src = Resolve-Path .\WindowsAgentAIOInstall.ps1
+          $out = Join-Path $PWD 'SafeCompliance-RustDesk-Agent.exe'
+          Invoke-ps2exe $src $out -noConsole -requireAdmin `
+            -title 'SafeCompliance RustDesk Agent' `
+            -company 'SafeCompliance' `
+            -product 'RustDesk Agent Installer' `
+            -fileVersion '1.0.0.0'
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SafeCompliance-RustDesk-Agent.exe
+          path: SafeCompliance-RustDesk-Agent.exe
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          name: "Agent build ${{ github.run_number }}"
+          files: SafeCompliance-RustDesk-Agent.exe
