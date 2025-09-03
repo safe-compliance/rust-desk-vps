@@ -1,104 +1,198 @@
-$ErrorActionPreference= 'silentlycontinue'
+# WindowsAgentAIOInstall_SafeCompliance.ps1
+# Auto-eleva, instala/atualiza RustDesk, aplica CFG e senha fixa, firewall,
+# trava TOMLs e cria tarefa de manutenção.
 
-# Assign the value random password to the password variable
-$rustdesk_pw=(-join ((65..90) + (97..122) | Get-Random -Count 12 | % {[char]$_}))
+$ErrorActionPreference = 'Stop'
 
-# Get your config string from your Web portal and Fill Below
-$rustdesk_cfg="0nI5EjMuYDMx4yM54iM3EzLvozcwRHdoJiOikGchJCLi0DO4JENGNkbUJ1R4dHNklEd4IzKm1mcSFHVIV0TylnY0YzRuhWdwYVbkZGWiojI5V2aiwiI5EjMuYDMx4yM54iM3EjI6ISehxWZyJCLikTMy4iNwEjLzkjLycTMiojI0N3boJye"
+# ======= AJUSTE AQUI se mudar seu domínio/credenciais do gohttpserver =======
+$ServerDomain = 'remoto.safecompliance.com.br'   # seu domínio
+$HttpUser     = 'admin'                           # basic auth do gohttpserver
+$HttpPass     = '3g49JdOkUCrgp4xg'                # basic auth do gohttpserver
+# ============================================================================
 
-################################### Please Do Not Edit Below This Line #########################################
+# Auto-elevação
+$me = [Security.Principal.WindowsIdentity]::GetCurrent()
+$admin = (New-Object Security.Principal.WindowsPrincipal $me).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $admin) {
+  Start-Process powershell.exe "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Verb RunAs
+  exit
+}
 
-# Run as administrator and stays in the current directory
-if (-Not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    if ([int](Get-CimInstance -Class Win32_OperatingSystem | Select-Object -ExpandProperty BuildNumber) -ge 6000) {
-        Start-Process PowerShell -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -Command `"cd '$pwd'; & '$PSCommandPath';`"";
-        Exit;
+# Lê o agent-config.json do servidor com Basic Auth
+$cfgUrl = "http://$ServerDomain:8000/agent-config.json"
+$basic  = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$HttpUser`:$HttpPass"))
+$hdrs   = @{ Authorization = "Basic $basic" }
+
+try {
+  $raw  = Invoke-WebRequest $cfgUrl -Headers $hdrs -UseBasicParsing
+  $obj  = $raw.Content | ConvertFrom-Json
+} catch {
+  Write-Host "Falha ao baixar agent-config.json de $cfgUrl" -f Red
+  throw
+}
+
+$RUSTDESK_CFG    = $obj.cfg
+$RUSTDESK_PERM_PW= $obj.perm_pw
+$RUSTDESK_HOST   = $obj.host
+$ALLOW_IP        = $obj.allow_ip
+$PORTS           = $obj.firewall_ports
+
+$RUSTDESK_EXE = 'C:\Program Files\RustDesk\rustdesk.exe'
+$PDATA        = 'C:\ProgramData\SafeCompliance\RustDesk'
+New-Item -ItemType Directory -Force $PDATA -ErrorAction SilentlyContinue | Out-Null
+
+function Get-LatestRustDeskTag {
+  try {
+    $u = 'https://github.com/rustdesk/rustdesk/releases/latest'
+    ([System.Net.WebRequest]::Create($u).GetResponse()).ResponseUri.OriginalString.Split('/')[-1].Trim('v')
+  } catch { $null }
+}
+
+function Install-Or-UpdateRustDesk {
+  if (!(Test-Path $RUSTDESK_EXE)) {
+    Write-Host "Instalando RustDesk..." -f Cyan
+  } else {
+    Write-Host "Verificando atualização do RustDesk..." -f Cyan
+  }
+
+  $tag = Get-LatestRustDeskTag
+  $dl  = if ($tag) {
+    "https://github.com/rustdesk/rustdesk/releases/download/$tag/rustdesk-$tag-x86_64.exe"
+  } else {
+    "https://github.com/rustdesk/rustdesk/releases/latest/download/rustdesk-x86_64.exe"
+  }
+
+  $tmp = Join-Path $env:TEMP 'rustdesk-setup.exe'
+  Invoke-WebRequest $dl -OutFile $tmp
+  Start-Process $tmp --% --silent-install -Wait
+  Start-Sleep 6
+
+  if (-not (Get-Service -Name rustdesk -ErrorAction SilentlyContinue)) {
+    Start-Process $RUSTDESK_EXE --% --install-service -Wait
+    Start-Sleep 6
+  }
+  $svc = Get-Service rustdesk -ErrorAction SilentlyContinue
+  if ($svc.Status -ne 'Running') { Start-Service rustdesk }
+}
+
+function Apply-Cfg-And-Password {
+  if (-not $RUSTDESK_CFG) { throw "CFG string não encontrada no agent-config.json" }
+  Write-Host "Aplicando configuração e senha permanente..." -f Cyan
+  Start-Process $RUSTDESK_EXE --% --config "$RUSTDESK_CFG" -WindowStyle Hidden -Wait
+  Start-Process $RUSTDESK_EXE --% --password "$RUSTDESK_PERM_PW" -WindowStyle Hidden -Wait
+}
+
+# Lock com SIDs (independe de idioma)
+function Lock-Dir($dir) {
+  if (!(Test-Path $dir)) { return }
+  icacls $dir /inheritance:r | Out-Null
+  icacls $dir /grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(F)" | Out-Null  # SYSTEM + Administrators
+  icacls $dir /deny      "*S-1-5-32-545:(OI)(CI)(W,M,DC)" "*S-1-1-0:(OI)(CI)(W,M,DC)" | Out-Null  # Users + Everyone
+}
+
+function Lock-UsersToml {
+  & $RUSTDESK_EXE --get-id | Out-Null
+  $meToml = Join-Path $env:APPDATA 'RustDesk\config\RustDesk2.toml'
+
+  $profiles = Get-CimInstance Win32_UserProfile |
+    Where-Object { $_.LocalPath -like 'C:\Users\*' -and (Split-Path -Leaf $_.LocalPath) -notin @('Public','Default','Default User','All Users') }
+
+  foreach ($p in $profiles) {
+    $cfgDir = Join-Path $p.LocalPath 'AppData\Roaming\RustDesk\config'
+    New-Item -ItemType Directory -Force $cfgDir | Out-Null
+    if (Test-Path $meToml) {
+      Copy-Item $meToml (Join-Path $cfgDir 'RustDesk2.toml') -Force -ErrorAction SilentlyContinue
     }
+    Lock-Dir $cfgDir
+  }
+  Write-Host "• TOMLs de usuários travados." -f Green
 }
 
-# Checks for the latest version of RustDesk
-$url = 'https://www.github.com//rustdesk/rustdesk/releases/latest'
-$request = [System.Net.WebRequest]::Create($url)
-$response = $request.GetResponse()
-$realTagUrl = $response.ResponseUri.OriginalString
-$RDLATEST = $realTagUrl.split('/')[-1].Trim('v')
-echo "RustDesk $RDLATEST is the latest version."
+function Lock-ServiceToml {
+  $svcDir = "C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk\config"
+  Start-Service rustdesk -ErrorAction SilentlyContinue; Start-Sleep 2
+  Stop-Service  rustdesk -ErrorAction SilentlyContinue; Start-Sleep 2
+  Start-Service rustdesk -ErrorAction SilentlyContinue; Start-Sleep 3
 
-# Checks the version of RustDesk installed.
-$rdver = ((Get-ItemProperty  "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\RustDesk\").Version)
+  $svcScript = @'
+$svcDir = "C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk\config"
+if (Test-Path $svcDir) {
+  icacls $svcDir /inheritance:r | Out-Null
+  icacls $svcDir /grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(F)" | Out-Null
+  icacls $svcDir /deny      "*S-1-5-32-545:(OI)(CI)(W,M,DC)" "*S-1-1-0:(OI)(CI)(W,M,DC)" | Out-Null
+}
+'@
+  $svcScriptPath = Join-Path $PDATA 'lock-rd-svc.ps1'
+  $svcScript | Set-Content -Encoding UTF8 $svcScriptPath
 
-# Skips to inputting the configuration if the latest version of RustDesk is already installed.
-if($rdver -eq "$RDLATEST") {
-echo "RustDesk $rdver is already installed."
-cd $env:ProgramFiles\RustDesk
-echo "Inputting configuration now."
-.\rustdesk.exe --config $rustdesk_cfg
-.\rustdesk.exe --password $rustdesk_pw
-$rustdesk_id = .\rustdesk.exe --get-id | Write-Output -OutVariable rustdesk_id
-echo "All done! Please double check the Network settings tab in RustDesk."
-echo ""
-echo "..............................................."
-# Show the value of the ID Variable
-echo "RustDesk ID: $rustdesk_id"
+  $act = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$svcScriptPath`""
+  $trg = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddSeconds(10))
+  $pri = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
 
-# Show the value of the Password Variable
-echo "Password: $rustdesk_pw"
-echo "..............................................."
-echo ""
-echo "Press Enter to open RustDesk."
-pause
-.\rustdesk.exe
-exit
+  Register-ScheduledTask -TaskName 'LockRustDeskSvcOnce' -Action $act -Trigger $trg -Principal $pri -Force | Out-Null
+  Start-ScheduledTask   -TaskName 'LockRustDeskSvcOnce'
+  Start-Sleep 15
+  Unregister-ScheduledTask -TaskName 'LockRustDeskSvcOnce' -Confirm:$false | Out-Null
+
+  Write-Host "• TOML do serviço travado." -f Green
 }
 
-if (!(Test-Path C:\Temp)) {
-  New-Item -ItemType Directory -Force -Path C:\Temp > null
+function Keep-Locked-OnLogon {
+  $maint = @'
+$profiles = Get-ChildItem -Directory C:\Users | Where-Object { $_.Name -notin "Public","Default","Default User","All Users" }
+foreach ($u in $profiles) {
+  $d = "$($u.FullName)\AppData\Roaming\RustDesk\config"
+  if (Test-Path $d) {
+    icacls $d /inheritance:r | Out-Null
+    icacls $d /grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(F)" | Out-Null
+    icacls $d /deny      "*S-1-5-32-545:(OI)(CI)(W,M,DC)" "*S-1-1-0:(OI)(CI)(W,M,DC)" | Out-Null
+  }
+}
+'@
+  $maintPath = Join-Path $PDATA 'lock-rd-maint.ps1'
+  $maint | Set-Content -Encoding UTF8 $maintPath
+
+  $trg = New-ScheduledTaskTrigger -AtLogOn
+  $act = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$maintPath`""
+  $pri = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+
+  Register-ScheduledTask -TaskName 'LockRustDeskConfig' -Trigger $trg -Action $act -Principal $pri -Force | Out-Null
+  Write-Host "• Tarefa de manutenção criada (trava a cada logon)." -f Green
 }
 
-cd C:\Temp
-echo "Downloading RustDesk version $RDLATEST."
-powershell Invoke-WebRequest "https://github.com/rustdesk/rustdesk/releases/download/$RDLATEST/rustdesk-$RDLATEST-x86_64.exe" -Outfile "rustdesk.exe"
-echo "Installing RustDesk version $RDLATEST."
-Start-Process .\rustdesk.exe --silent-install
-Start-Sleep -Seconds 10
+function Configure-Firewall {
+  Write-Host "Aplicando regras de firewall..." -f Cyan
+  $remote = if ($ALLOW_IP) { "$RUSTDESK_HOST,$ALLOW_IP" } else { $RUSTDESK_HOST }
+  $ports  = if ($PORTS) { ($PORTS -join ',') } else { '21115,21116,21117,21118,21119,443' }
 
-$ServiceName = 'rustdesk'
-$arrService = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+  New-NetFirewallRule -DisplayName "RustDesk - SafeCompliance allow" `
+    -Program "$RUSTDESK_EXE" `
+    -Direction Outbound -Action Allow `
+    -RemoteAddress $remote `
+    -RemotePort $ports `
+    -Protocol TCP -ErrorAction SilentlyContinue | Out-Null
 
-if ($arrService -eq $null)
-{
-    echo "Installing service."
-    cd $env:ProgramFiles\RustDesk
-    Start-Process .\rustdesk.exe --install-service -wait -Verbose
-    Start-Sleep -Seconds 20
+  New-NetFirewallRule -DisplayName "RustDesk - block others" `
+    -Program "$RUSTDESK_EXE" `
+    -Direction Outbound -Action Block -ErrorAction SilentlyContinue | Out-Null
 }
 
-while ($arrService.Status -ne 'Running')
-{
-    Start-Service $ServiceName
-    Start-Sleep -seconds 5
-    $arrService.Refresh()
-}
+# ===== EXECUÇÃO =====
+Install-Or-UpdateRustDesk
+Apply-Cfg-And-Password
+Lock-UsersToml
+Lock-ServiceToml
+Keep-Locked-OnLogon
+Configure-Firewall
 
-# Waits for installation to complete before proceeding.
-echo "Please wait a few seconds."
-Start-Sleep -Seconds 10
+try {
+  $id = & $RUSTDESK_EXE --get-id
+  Write-Host ""
+  Write-Host "========================================="
+  Write-Host " RustDesk ID........: $id"
+  Write-Host " Senha permanente...: $RUSTDESK_PERM_PW"
+  Write-Host " Servidor...........: $RUSTDESK_HOST"
+  Write-Host "========================================="
+} catch {}
 
-cd $env:ProgramFiles\RustDesk
-echo "Inputting configuration now."
-.\rustdesk.exe --config $rustdesk_cfg
-.\rustdesk.exe --password $rustdesk_pw
-$rustdesk_id = .\rustdesk.exe --get-id | Write-Output -OutVariable rustdesk_id
-echo "All done! Please double check the Network settings tab in RustDesk."
-echo ""
-echo "..............................................."
-# Show the value of the ID Variable
-echo "RustDesk ID: $rustdesk_id"
-
-# Show the value of the Password Variable
-echo "Password: $rustdesk_pw"
-echo "..............................................."
-echo ""
-echo "Press Enter to open RustDesk."
-pause
-.\rustdesk.exe
+Write-Host "Concluído." -f Green

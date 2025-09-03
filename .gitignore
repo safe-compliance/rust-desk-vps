@@ -1,4 +1,3 @@
-# Não versionar binários/artefatos grandes ou segredos
 *.exe
 *.zip
 *.tar
