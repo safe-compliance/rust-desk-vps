@@ -22,24 +22,21 @@ jobs:
           [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
           Set-ExecutionPolicy Bypass -Scope Process -Force
 
-      # ⚠️ Baixa o ps2exe.ps1 correto (UMA linha, caminho completo!)
-      - name: Download ps2exe.ps1 (raw)
+      - name: Install ps2exe module (PowerShell Gallery)
         shell: powershell
         run: |
-          Invoke-WebRequest 'https://raw.githubusercontent.com/MScholtes/PS2EXE/master/ps2exe.ps1' -UseBasicParsing -OutFile .\ps2exe.ps1
+          Install-PackageProvider -Name NuGet -Force -Scope CurrentUser
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Install-Module -Name ps2exe -Scope CurrentUser -Force
+          Import-Module ps2exe
 
-      # Compila o seu WindowsAgentAIOInstall.ps1 em EXE
       - name: Compile EXE
         shell: powershell
         run: |
           $src = Resolve-Path .\WindowsAgentAIOInstall.ps1
           $out = Join-Path $PWD 'SafeCompliance-RustDesk-Agent.exe'
-          # usa o ps2exe.ps1 “raw”; evita parâmetros que variam por versão
-          powershell -ExecutionPolicy Bypass -File .\ps2exe.ps1 `
-            -inputFile  $src `
-            -outputFile $out `
-            -noConsole `
-            -requireAdmin `
+          Import-Module ps2exe
+          Invoke-ps2exe -inputFile $src -outputFile $out -noConsole -requireAdmin `
             -title   'SafeCompliance RustDesk Agent' `
             -company 'SafeCompliance' `
             -product 'RustDesk Agent Installer'
