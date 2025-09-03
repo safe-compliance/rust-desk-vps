@@ -1,38 +1,72 @@
 name: Build Agent EXE
 
 on:
+  workflow_dispatch:
   push:
     paths:
       - 'WindowsAgentAIOInstall.ps1'
-  workflow_dispatch:
 
 permissions:
-  contents: write   # necessário para criar Release
+  contents: write   # para criar Release com GITHUB_TOKEN
 
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: windows-2022  # fixa o runner
     steps:
       - uses: actions/checkout@v4
 
-      - name: Trust PSGallery
-        shell: pwsh
-        run: Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
-
-      - name: Install ps2exe
-        shell: pwsh
-        run: Install-Module ps2exe -Scope CurrentUser -Force
-
-      - name: Compile EXE
-        shell: pwsh
+      - name: Enable TLS1.2 + ExecutionPolicy Bypass
+        shell: powershell
         run: |
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          Set-ExecutionPolicy Bypass -Scope Process -Force
+          $PSVersionTable.PSVersion
+          Write-Host "Using Windows PowerShell"
+
+      - name: Install NuGet + PowerShellGet + ps2exe (module)
+        shell: powershell
+        continue-on-error: true
+        run: |
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Install-PackageProvider -Name NuGet -Force -Scope CurrentUser
+          Install-Module PowerShellGet -Scope CurrentUser -Force -AllowClobber
+          Install-Module ps2exe -Scope CurrentUser -Force -AllowClobber
+          Get-Module -ListAvailable ps2exe | Format-Table Name,Version,ModuleBase
+
+      - name: Compile with module or fallback to raw ps2exe.ps1
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
           $src = Resolve-Path .\WindowsAgentAIOInstall.ps1
           $out = Join-Path $PWD 'SafeCompliance-RustDesk-Agent.exe'
-          Invoke-ps2exe $src $out -noConsole -requireAdmin `
-            -title 'SafeCompliance RustDesk Agent' `
-            -company 'SafeCompliance' `
-            -product 'RustDesk Agent Installer' `
-            -fileVersion '1.0.0.0'
+
+          if (Get-Command Invoke-ps2exe -ErrorAction SilentlyContinue) {
+            Write-Host ">> Using ps2exe MODULE"
+            try {
+              Import-Module ps2exe -Force
+              Invoke-ps2exe $src $out -noConsole -requireAdmin `
+                -title 'SafeCompliance RustDesk Agent' `
+                -company 'SafeCompliance' `
+                -product 'RustDesk Agent Installer' `
+                -fileVersion '1.0.0.0'
+            } catch {
+              Write-Host "MODULE build failed: $($_.Exception.Message)"
+              throw
+            }
+          } else {
+            Write-Host ">> Module not found, using RAW SCRIPT fallback"
+            Invoke-WebRequest https://raw.githubusercontent.com/MScholtes/PS2EXE/master/ps2exe.ps1 -OutFile ps2exe.ps1
+            powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ps2exe.ps1 `
+              "$src" "$out" -noconsole -requireAdmin `
+              -title 'SafeCompliance RustDesk Agent' `
+              -company 'SafeCompliance' `
+              -product 'RustDesk Agent Installer' `
+              -fileVersion '1.0.0.0'
+          }
+
+          if (-not (Test-Path $out)) { throw "EXE não foi gerado." }
+          (Get-Item $out).FullName
+          Get-Item $out | Format-List * | Out-String | Write-Host
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -40,7 +74,7 @@ jobs:
           name: SafeCompliance-RustDesk-Agent.exe
           path: SafeCompliance-RustDesk-Agent.exe
 
-      - name: Release
+      - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ github.run_number }}
