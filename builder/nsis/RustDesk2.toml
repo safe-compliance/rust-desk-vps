@@ -1,0 +1,5 @@
+[options]
+custom-rendezvous-server = "remoto.safecompliance.com.br"
+custom-relay-server      = "remoto.safecompliance.com.br:21117"
+server-public-key        = "R1uQ4sVFh2qWPQ0CgGtDaZ7OAdnuYWJs0jEM9LXCo64="
+prefer-custom-server     = true
